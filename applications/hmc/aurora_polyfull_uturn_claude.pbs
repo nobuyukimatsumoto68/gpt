@@ -1,0 +1,65 @@
+#!/bin/bash
+#PBS -N polyfull_uturn
+#PBS -A GenesisHackathonOct26
+#PBS -q R8914313
+#PBS -l select=1
+#PBS -l walltime=01:30:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#
+# U-turn test of the ML loss's prediction (genesis/rmhmc_trainable_kernel_impl_plan_claude.md, entries (18)-(19)):
+# FA polynomial kernels N=2 vs N=8 with the FULL improved covariant Laplacian (--longitudinal 1),
+# 8^4 Iwasaki beta = 2.95 from therm_8888_b.cfg, one python process per PVC tile, side by side:
+#   tile 0: test_poly_kernel_claude.py --L 8 --skip_leapfrog --longitudinal  (quick Aurora check)
+#   tile 1: eval_ml_loss_claude.py --family polyfull --op hessian            (the loss's prediction)
+#   tile 2: decorrelation, poly N=2 longitudinal, nstep NSTEP, NTRAJ traj, --meas_every 1 --log_h 1
+#   tile 3: decorrelation, poly N=8 longitudinal, nstep NSTEP, NTRAJ traj, --meas_every 1 --log_h 1
+# References (already measured, PBS 8932923): fp_blk_e0 (eta = 0), fp_blk_poly (transverse N=8).
+# Decision metric: first zero crossings of C_1, C_2, C_4 and their max/min spread, N=2 vs N=8
+# (the loss predicts a smaller spread for N=2).
+# NOT EXACT: no volume preservation for U-dependent kernels (arXiv:2412.19904).
+# Submit with aurora_polyfull_uturn_submit_claude.sh (sets RUN, GPT, NSTEP, NTRAJ).
+set -u
+
+GPT=${GPT:-/flare/GenesisHackathonOct26/nmatsum/gpt}
+HMC=${GPT}/applications/hmc
+RUN=${RUN:-/flare/GenesisHackathonOct26/nmatsum/run_decorr_claude}
+NSTEP=${NSTEP:-60}
+NTRAJ=${NTRAJ:-4}
+cd ${RUN}
+
+# lmod scripts reference unset variables, so relax `set -u` around module loads.
+set +u
+module load frameworks            # python3.12 + numpy, as used to build cgpt
+set -u
+source ${GPT}/lib/cgpt/build/source.sh
+export SYCL_PROGRAM_COMPILE_OPTIONS="-ze-opt-large-register-file"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT   # 12 tiles visible as 12 devices
+export OMP_NUM_THREADS=8
+
+COMMON="--L 8,8,8,8 --action iwasaki --beta 2.95 --tol 1e-10 --mpi 1.1.1.1 --stot 3.0 --js 1,2,4 --load therm_8888_b.cfg"
+TAG=${PBS_JOBID%%.*}
+
+on_tile() {  # on_tile <tile> <log> <cmd...>: start in background, pinned to one tile
+  local tile=$1 log=$2; shift 2
+  echo "==== [$(date -u +%T) UTC] tile ${tile} -> ${log}: $*"
+  ZE_AFFINITY_MASK=${tile} "$@" > ${RUN}/${log} 2>&1 &
+}
+
+echo "==== job ${PBS_JOBID} on $(hostname), gpt $(git -C ${GPT} log --oneline -1)"
+on_tile 0 pf_${TAG}_test_poly_long_claude.log python3 ${HMC}/test_poly_kernel_claude.py --L 8 --skip_leapfrog --longitudinal --mpi 1.1.1.1
+on_tile 1 pf_${TAG}_eval_ml_loss_claude.log python3 ${HMC}/eval_ml_loss_claude.py --load therm_8888_b.cfg \
+    --family polyfull --op hessian --nprobe 12 --nshell 6 --mpi 1.1.1.1
+for N in 2 8; do
+  on_tile $((N == 2 ? 2 : 3)) pf_${TAG}_polyfull_N${N}_claude.log python3 ${HMC}/decorrelation_claude.py ${COMMON} \
+      --kernel poly --poly_N ${N} --longitudinal 1 --nstep ${NSTEP} --n ${NTRAJ} --meas_every 1 --log_h 1 \
+      --seed pf_N${N} --out pf_${TAG}_polyfull_N${N}_claude.dat
+done
+wait
+
+echo "==== [$(date -u +%T) UTC] all tiles done"
+for f in ${RUN}/pf_${TAG}_*_claude.log; do
+  echo "---- $(basename ${f})"
+  grep -h -E "ALL PASS|SOME FAILED|Traceback|Error" ${f} | tail -3
+  grep -h "TRAJ" ${f} | tail -${NTRAJ}
+done

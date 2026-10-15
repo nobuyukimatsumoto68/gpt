@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -N poly_firstpass
+#PBS -A GenesisHackathonOct26
+#PBS -q R8914313
+#PBS -l select=1
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#
+# First pass of the U-turn study (genesis/rmhmc_trainable_kernel_impl_plan_claude.md, entry (15)):
+# 8^4 Iwasaki beta = 2.95 from therm_8888_b.cfg, one python process per PVC tile, side by side:
+#   tile 0: test_poly_kernel_claude.py --L 8 --skip_leapfrog  (quick Aurora check)
+#   tile 1: poly (N=8 FA) kernel, nstep NSTEP_POLY, 1 traj, --meas_every 1 --log_h 2
+#   tile 2: eta = 0 reference,          nstep NSTEP_MASKED, --meas_every 1
+#   tile 3: masked transverse n=2 (eta 0.05), nstep NSTEP_MASKED, --meas_every 1
+#   tile 4: masked transverse n=4 (eta 0.05), nstep NSTEP_MASKED, --meas_every 1
+# NOT EXACT: no volume preservation for U-dependent kernels (arXiv:2412.19904).
+# Submit with aurora_poly_firstpass_submit_claude.sh (sets RUN, GPT, NSTEP_POLY, NSTEP_MASKED, NTRAJ).
+set -u
+
+GPT=${GPT:-/flare/GenesisHackathonOct26/nmatsum/gpt}
+HMC=${GPT}/applications/hmc
+RUN=${RUN:-/flare/GenesisHackathonOct26/nmatsum/run_decorr_claude}
+NSTEP_POLY=${NSTEP_POLY:-60}
+NSTEP_MASKED=${NSTEP_MASKED:-200}
+NTRAJ=${NTRAJ:-1}
+cd ${RUN}
+
+# lmod scripts reference unset variables, so relax `set -u` around module loads.
+set +u
+module load frameworks            # python3.12 + numpy, as used to build cgpt
+set -u
+source ${GPT}/lib/cgpt/build/source.sh
+export SYCL_PROGRAM_COMPILE_OPTIONS="-ze-opt-large-register-file"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT   # 12 tiles visible as 12 devices
+export OMP_NUM_THREADS=8               # 5 processes x 8 threads < 104 host cores
+
+COMMON="--L 8,8,8,8 --action iwasaki --beta 2.95 --tol 1e-10 --mpi 1.1.1.1 --stot 3.0 --js 1,2,4 --load therm_8888_b.cfg"
+TAG=${PBS_JOBID%%.*}
+
+on_tile() {  # on_tile <tile> <log> <cmd...>: start in background, pinned to one tile
+  local tile=$1 log=$2; shift 2
+  echo "==== [$(date -u +%T) UTC] tile ${tile} -> ${log}: $*"
+  ZE_AFFINITY_MASK=${tile} "$@" > ${RUN}/${log} 2>&1 &
+}
+
+echo "==== job ${PBS_JOBID} on $(hostname), gpt $(git -C ${GPT} log --oneline -1)"
+on_tile 0 fp_${TAG}_test_poly_claude.log python3 ${HMC}/test_poly_kernel_claude.py --L 8 --skip_leapfrog --mpi 1.1.1.1
+on_tile 1 fp_${TAG}_poly_claude.log python3 ${HMC}/decorrelation_claude.py ${COMMON} \
+    --kernel poly --nstep ${NSTEP_POLY} --n ${NTRAJ} --meas_every 1 --log_h 2 \
+    --seed fp_poly --out fp_${TAG}_poly_claude.dat
+on_tile 2 fp_${TAG}_e0_claude.log python3 ${HMC}/decorrelation_claude.py ${COMMON} \
+    --eta 0.0 --niter 1 --nstep ${NSTEP_MASKED} --n ${NTRAJ} --meas_every 1 \
+    --seed fp_e0 --out fp_${TAG}_e0_claude.dat
+on_tile 3 fp_${TAG}_n2_claude.log python3 ${HMC}/decorrelation_claude.py ${COMMON} \
+    --eta 0.05 --niter 2 --nstep ${NSTEP_MASKED} --n ${NTRAJ} --meas_every 1 \
+    --seed fp_n2 --out fp_${TAG}_n2_claude.dat
+on_tile 4 fp_${TAG}_n4_claude.log python3 ${HMC}/decorrelation_claude.py ${COMMON} \
+    --eta 0.05 --niter 4 --nstep ${NSTEP_MASKED} --n ${NTRAJ} --meas_every 1 \
+    --seed fp_n4 --out fp_${TAG}_n4_claude.dat
+wait
+
+echo "==== [$(date -u +%T) UTC] all tiles done"
+for f in ${RUN}/fp_${TAG}_*_claude.log; do
+  echo "---- $(basename ${f})"
+  grep -h -E "ALL PASS|SOME FAILED|Traceback|Error" ${f} | tail -3
+  grep -h "TRAJ" ${f} | tail -2
+done
