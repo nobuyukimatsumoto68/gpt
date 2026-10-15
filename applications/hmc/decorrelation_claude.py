@@ -14,7 +14,7 @@
 # Usage:
 #   python3 decorrelation_claude.py --eta 0.05 --niter 2 --stot 3.0 --nstep 60 --n 10 --load therm.cfg \
 #       [--L 8,8,8,8] [--beta 2.95] [--action iwasaki] [--js 1,2,4] [--meas_every 1] [--tol 1e-10] \
-#       [--kernel transverse|poly] [--poly_N 2|4|6|8] [--longitudinal 0|1] [--cg_tol 1e-10] [--seed s] [--out file.dat] [--save final.cfg]
+#       [--kernel transverse|poly] [--poly_N 2|4|6|8] [--longitudinal 0|1] [--coeffs_file trained_coeffs.py] [--cg_tol 1e-10] [--seed s] [--out file.dat] [--save final.cfg]
 # Output (--out): one line per (trajectory, measurement): traj acc dH k t C C_j1 C_j2 ...
 #
 import gpt as g
@@ -67,6 +67,12 @@ if kernel == "poly":
     from poly_coeffs_full_claude import COEFFS as COEFFS_FULL
 
     coeffs = COEFFS_FULL[poly_N] if longitudinal else COEFFS_TRANS[poly_N]
+    coeffs_file = g.default.get("--coeffs_file", None)  # e.g. trained *_coeffs.py from train_poly_claude.py (COEFFS_TRAINED)
+    if coeffs_file is not None:
+        _ns = {}
+        exec(open(coeffs_file).read(), _ns)
+        coeffs = _ns["COEFFS_TRAINED"]
+        g.message(f"coefficients from {coeffs_file}: {coeffs}")
     poly_functional_base.transport_cache = True  # reuse transports while U is unchanged (fingerprint-checked)
     poly_functional_base.longitudinal = bool(longitudinal)
     # K = poly_kinetic(COEFFS_N8)
@@ -96,7 +102,7 @@ g.message(f"lattice {L}, {action} beta = {beta}, kernel = {kernel}, poly_N = {po
 fout = open(out, "wt") if (out is not None and g.rank() == 0) else None
 if fout is not None:
     # fout.write(f"# kernel {kernel} eta {eta} niter {niter} stot {stot} nstep {nstep} L {L} {action} beta {beta} js {js}\n")
-    kpar = (f"poly_N {poly_N} longitudinal {longitudinal} (eta/niter unused)" if kernel == "poly" else f"eta {eta} niter {niter}")
+    kpar = (f"poly_N {poly_N} longitudinal {longitudinal} coeffs_file {g.default.get('--coeffs_file', None)} (eta/niter unused)" if kernel == "poly" else f"eta {eta} niter {niter}")
     fout.write(f"# kernel {kernel} {kpar} stot {stot} nstep {nstep} L {L} {action} beta {beta} js {js}\n")
     fout.write("# traj acc dH k t C " + " ".join(f"C_j{j}" for j in js) + "\n")
 
