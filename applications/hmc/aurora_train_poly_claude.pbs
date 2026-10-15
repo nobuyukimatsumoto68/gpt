@@ -1,0 +1,81 @@
+#!/bin/bash
+#PBS -N train_poly
+#PBS -A GenesisHackathonOct26
+#PBS -q R8914313
+#PBS -l select=1
+#PBS -l walltime=02:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#
+# Train the FA-polynomial coefficients on the 8^4 config, then U-turn runs with the trained kernels
+# (genesis/rmhmc_trainable_kernel_impl_plan_claude.md; ML loss entries (18)-(19)). Full improved Laplacian
+# (--longitudinal 1), Iwasaki beta = 2.95, therm_8888_b.cfg. Two chains run side by side, one per PVC tile:
+#   tile 4: train_poly_claude.py --N 2 (maxeval MAXEVAL_N2), then decorrelation with the trained N=2 coeffs
+#   tile 5: train_poly_claude.py --N 8 (maxeval MAXEVAL_N8), then decorrelation with the trained N=8 coeffs
+# Training: Nelder-Mead over the complex roots (K stays positive definite), ratio loss N tr(M^2)/(tr M)^2 - 1 of
+# M = A (-\Delta[U]) A^\dagger, fixed probes, then VALIDATION on fresh probes. Writes <out>_coeffs.py, <out>_history.dat.
+# NOT EXACT: no volume preservation for U-dependent kernels (arXiv:2412.19904).
+# Submit with aurora_train_poly_submit_claude.sh.
+set -u
+
+GPT=${GPT:-/flare/GenesisHackathonOct26/nmatsum/gpt}
+HMC=${GPT}/applications/hmc
+RUN=${RUN:-/flare/GenesisHackathonOct26/nmatsum/run_decorr_claude}
+MAXEVAL_N2=${MAXEVAL_N2:-200}
+MAXEVAL_N8=${MAXEVAL_N8:-300}
+NSTEP_N2=${NSTEP_N2:-120}
+NSTEP_N8=${NSTEP_N8:-60}
+NTRAJ=${NTRAJ:-4}
+cd ${RUN}
+
+# lmod scripts reference unset variables, so relax `set -u` around module loads.
+set +u
+module load frameworks            # python3.12 + numpy, as used to build cgpt
+set -u
+source ${GPT}/lib/cgpt/build/source.sh
+export SYCL_PROGRAM_COMPILE_OPTIONS="-ze-opt-large-register-file"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT   # 12 tiles visible as 12 devices
+export OMP_NUM_THREADS=8
+
+COMMON="--L 8,8,8,8 --action iwasaki --beta 2.95 --tol 1e-10 --mpi 1.1.1.1 --stot 3.0 --js 1,2,4 --load therm_8888_b.cfg"
+TAG=${PBS_JOBID%%.*}
+
+chain() {  # chain <tile> <N> <maxeval> <nstep>: train, then U-turn with the trained coefficients
+  local tile=$1 N=$2 maxeval=$3 nstep=$4
+  local out=tr_${TAG}_full_N${N}_claude
+  echo "==== [$(date -u +%T) UTC] tile ${tile}: train N=${N} (maxeval ${maxeval}) -> ${out}"
+  # windows include the j=1 shell (lam0 = 4 sin^2(pi/8) = 0.586 on 8^4), the slowest shell for all untrained N>0
+  # ZE_AFFINITY_MASK=${tile} python3 ${HMC}/train_poly_claude.py --load therm_8888_b.cfg --N ${N} --longitudinal 1 \
+  #     --nprobe 6 --windows 1,2,4,8,12,16 --sigma 1.0 --maxeval ${maxeval} --mpi 1.1.1.1 --out ${out} \
+  #     > ${RUN}/${out}_train.log 2>&1
+  # ZE_AFFINITY_MASK=${tile} python3 ${HMC}/train_poly_claude.py --load therm_8888_b.cfg --N ${N} --longitudinal 1 \
+  #     --nprobe 6 --windows 0.59,2,4,8,12,16 --sigma 1.0 --maxeval ${maxeval} --mpi 1.1.1.1 --out ${out} \
+  #     > ${RUN}/${out}_train.log 2>&1
+  # NM's direct ratio loss: N tr(M^2)/(tr M)^2 - 1, M = A (-\Delta[U]) A^\dagger (full covariant adjoint Laplacian),
+  # Hutchinson with fixed probes; windows are only used for the diagnostic shell report.
+  ZE_AFFINITY_MASK=${tile} python3 ${HMC}/train_poly_claude.py --load therm_8888_b.cfg --N ${N} --longitudinal 1 \
+      --loss ratio --op laplace \
+      --nprobe 6 --windows 0.59,2,4,8,12,16 --sigma 1.0 --maxeval ${maxeval} --mpi 1.1.1.1 --out ${out} \
+      > ${RUN}/${out}_train.log 2>&1
+  if [ ! -f ${RUN}/${out}_coeffs.py ]; then
+    echo "==== tile ${tile}: no ${out}_coeffs.py, skipping the U-turn run"
+    return 1
+  fi
+  echo "==== [$(date -u +%T) UTC] tile ${tile}: U-turn N=${N} trained, nstep ${nstep}"
+  ZE_AFFINITY_MASK=${tile} python3 ${HMC}/decorrelation_claude.py ${COMMON} \
+      --kernel poly --poly_N ${N} --longitudinal 1 --coeffs_file ${RUN}/${out}_coeffs.py \
+      --nstep ${nstep} --n ${NTRAJ} --meas_every 1 --log_h 1 --seed tr_N${N} \
+      --out ${out}_uturn.dat > ${RUN}/${out}_uturn.log 2>&1
+}
+
+echo "==== job ${PBS_JOBID} on $(hostname), gpt $(git -C ${GPT} log --oneline -1)"
+chain 4 2 ${MAXEVAL_N2} ${NSTEP_N2} &
+chain 5 8 ${MAXEVAL_N8} ${NSTEP_N8} &
+wait
+
+echo "==== [$(date -u +%T) UTC] all chains done"
+for f in ${RUN}/tr_${TAG}_*_claude_*.log; do
+  echo "---- $(basename ${f})"
+  grep -h -E "VALIDATION|Traceback|Error" ${f} | tail -3
+  grep -h "TRAJ" ${f} | tail -${NTRAJ}
+done

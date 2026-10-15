@@ -10,6 +10,9 @@
 # Design: genesis/rmhmc_trainable_kernel_impl_plan_claude.md, entries (18)-(20).
 # Usage: python3 train_poly_claude.py --load cfg --N 8 [--longitudinal 1] [--beta 2.95] [--nprobe 4]
 #          [--windows 1,2,4,8,12,16] [--sigma 1.0] [--maxeval 300] [--out base]
+#          [--loss shell|ratio] [--op hessian|laplace]
+#   --loss ratio (NM's direct loss): N tr(M^2)/(tr M)^2 - 1 (Hutchinson, fixed independent probe sets for numerator and
+#                denominator; >= 0, = 0 iff all eigenvalues of M equal);  --op laplace: M = A (-Delta[U]) A^dagger
 #
 import gpt as g
 import numpy as np
@@ -35,9 +38,15 @@ roots_file = os.path.join(
     "fa_complex_full_claude_roots.dat" if longitudinal else "fa_complex_claude_roots.dat",
 )
 
+lossname = g.default.get("--loss", "shell")
+op = g.default.get("--op", "hessian")
 U = g.load(load)
 S = g.qcd.gauge.action.iwasaki(beta)
 H = hessian_fd(S, 1e-5, symmetric=True)
+if op == "laplace":
+    _lap = covariant_gaussian_filter(U, 4.0, 1.0)  # only .laplace (full covariant adjoint Laplacian) is used
+    H = lambda U_, v: [g(-1.0 * _lap.laplace(x)) for x in v]
+Ndof = 8 * len(U) * U[0].grid.gsites
 
 # initial roots from the analytic FA fit, recovered from the coefficient modules (no data-file dependency; runs on Aurora):
 #   beta = 1/c0, alpha = -2 s/c0  ->  s = -alpha/(2 beta), Im z = sqrt(c0 - s^2), Re z = T0 - s
@@ -86,11 +95,34 @@ def omega2(coeffs):
     return np.array([np.mean([ip(p, L.M(p)) / nn for p, nn in zip(lst, nl)]) for lst, nl in zip(GX, norms)])
 
 
+# direct per-mode ratio (NM): fixed unfiltered probes, independent sets for tr M^2 and tr M
+PN, PD = [], []
+for i in range(nprobe):
+    for lst in (PN, PD):
+        xi = g.group.cartesian(U)
+        rng.normal_element(xi)
+        lst.append(xi)
+
+
+def ratio(coeffs, PN_=None, PD_=None):
+    PN_ = PN if PN_ is None else PN_
+    PD_ = PD if PD_ is None else PD_
+    L = speed_loss(U, kernel_poly(U, coeffs, longitudinal=longitudinal), H)
+    R, trM, trM2 = L.estimate(PN_, PD_)
+    return Ndof * R - 1.0
+
+
 hist = []
 
 
 def loss(x):
     co, z = coeffs_of(np.asarray(x))
+    if lossname == "ratio":
+        v = float(ratio(co))
+        hist.append((v, np.array([v]), np.asarray(x).copy()))
+        if len(hist) % 10 == 1:
+            g.message(f"eval {len(hist)}: ratio loss N trM2/trM^2 - 1 = {v:.6f}")
+        return v
     w2 = omega2(co)
     if np.any(w2 <= 0):
         return 1e3
@@ -104,7 +136,7 @@ def loss(x):
 t0 = time.time()
 l0 = loss(x0)
 w0 = hist[-1][1]
-g.message(f"start (analytic FA, N={N}, longitudinal={longitudinal}): loss {l0:.6f}, omega^2 = {np.array2string(w0, precision=3)}")
+g.message(f"start (analytic FA, N={N}, longitudinal={longitudinal}, loss={lossname}, op={op}): loss {l0:.6f}, omega^2 = {np.array2string(w0, precision=3)}")
 x, fv, nev = nelder_mead(loss, x0, step=0.3, tol=1e-7, max_eval=maxeval)
 co, z = coeffs_of(x)
 w2 = omega2(co)
@@ -131,9 +163,19 @@ GX, norms = GX_train, norms_train
 v_start, v_tr = float(np.var(np.log(w_start_v))), float(np.var(np.log(w_tr_v)))
 g.message(f"VALIDATION (fresh probes): start loss {v_start:.6f} omega^2 {np.array2string(w_start_v, precision=3)}")
 g.message(f"VALIDATION (fresh probes): trained loss {v_tr:.6f} omega^2 {np.array2string(w_tr_v, precision=3)}")
+PNv, PDv = [], []
+for i in range(nprobe):
+    for lst in (PNv, PDv):
+        xi = g.group.cartesian(U)
+        rngv.normal_element(xi)
+        lst.append(xi)
+r_start_v, r_tr_v = ratio(coeffs_of(x0)[0], PNv, PDv), ratio(co, PNv, PDv)
+g.message(f"VALIDATION (fresh probes, op={op}): ratio loss N trM2/trM^2 - 1: start {r_start_v:.6f} -> trained {r_tr_v:.6f}")
+if lossname == "ratio":
+    v_start, v_tr = float(r_start_v), float(r_tr_v)
 if g.rank() == 0:
     with open(out + "_coeffs.py", "wt") as f:
-        f.write(f"# trained by train_poly_claude.py on {load}; N={N}, longitudinal={longitudinal}, windows={windows}, sigma={sigma}, nprobe={nprobe}\n")
+        f.write(f"# trained by train_poly_claude.py on {load}; N={N}, longitudinal={longitudinal}, loss={lossname}, op={op}, windows={windows}, sigma={sigma}, nprobe={nprobe}\n")
         f.write(f"# loss Var log omega_j^2: start {l0:.6f} -> trained {fv:.6f} ({nev} evals)\n")
         f.write(f"# start roots {list(np.round(z0, 6))}\n# trained roots {list(np.round(z, 6))}\n")
         f.write(f"# validation (fresh probes): start {v_start:.6f} -> trained {v_tr:.6f}\n")
