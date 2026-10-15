@@ -41,6 +41,7 @@ seed = g.default.get("--seed", "decorrelation_claude")
 load = g.default.get("--load", None)
 save = g.default.get("--save", None)
 out = g.default.get("--out", None)
+log_h = g.default.get_int("--log_h", 0)  # 1: print H(t) - H(0) after every MD step (diagnostic)
 
 grid = g.grid(L, g.double)
 rng = g.random(seed)
@@ -86,6 +87,8 @@ for i in range(n):
     rows = [(0, 0.0, 1.0, [1.0] * len(js))]
 
     def measure(k, U_, P_):
+        if log_h:  # diagnostic: H(t) after every MD step
+            g.message(f"H_STEP traj {i} k {k} t {k * stot / nstep:.4f} H-H0 {lf.hamiltonian(U_, P_) - h0:.6e} niter {lf.niter_log[-1]}")
         # if k % meas_every != 0:
         if meas_every <= 0 or k % meas_every != 0:  # meas_every = 0: no measurements (nstep tuning)
             return
