@@ -172,7 +172,8 @@ class implicit_leapfrog:
         if self.verbose:
             g.message(f"implicit_leapfrog step_aitken: n_P = {n_P}, n_U = {n_U}")
 
-    def __call__(self, U, P, tau, nstep):
+    # callback(k, U, P) is called after MD step k = 1..nstep (optional; for measurements along the trajectory)
+    def __call__(self, U, P, tau, nstep, callback=None):
         eps = tau / nstep
         for i in range(nstep):
             # self.step(U, P, eps)
@@ -180,3 +181,5 @@ class implicit_leapfrog:
                 self.step_aitken(U, P, eps)
             else:
                 self.step(U, P, eps)
+            if callback is not None:
+                callback(i + 1, U, P)
