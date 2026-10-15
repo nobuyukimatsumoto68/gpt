@@ -2,12 +2,13 @@
 # Build Grid (lehner/Grid, branch feature/gpt) + GPT (cgpt) on ALCF Aurora (Intel PVC, SYCL).
 # Adapted from NM's LLNL Tuolumne (HIP) Grid build script; configure flags follow
 # lehner/Grid systems/Aurora/config-command (SYCL). Sources:
-#   GPT:  C. Lehner et al., https://github.com/lehner/gpt (branch 2024-10)
+#   GPT:  C. Lehner et al., https://github.com/lehner/gpt (master; NM fork nobuyukimatsumoto68/gpt)
 #   Grid: P. Boyle et al., arXiv:1512.03487; fork https://github.com/lehner/Grid (feature/gpt)
 # Note: the commented `rm` / `find -delete` lines of the Tuolumne script are dropped (house no-rm rule).
 #
 # Usage (on an Aurora login node):  bash aurora_build_claude.sh [stage]
 #   stage = grid | gpt | all (default all). Each stage logs to ${dir_log}/<step>.log.
+#   grid is incremental once configured; FORCE_CONFIGURE=1 bash aurora_build_claude.sh grid reconfigures.
 set -u
 
 stage=${1:-all}
@@ -78,6 +79,10 @@ build_grid() {
   cd ${dir_build}
   [ -d Grid ] || run grid_clone git clone -b feature/gpt https://github.com/lehner/Grid
   cd Grid
+  # Incremental by default: once Grid/build is configured (config.status exists), skip bootstrap +
+  # configure and only run make (rebuilds just what is missing/stale). FORCE_CONFIGURE=1 redoes both,
+  # e.g. after changing configure flags below (that usually means a full recompile).
+  if [ "${FORCE_CONFIGURE:-0}" = "1" ] || [ ! -f ${dir_build}/Grid/build/config.status ]; then
   run bootstrap ./bootstrap.sh
   mkdir -p ${dir_build}/Grid/build; cd ${dir_build}/Grid/build
   # build dir is Grid/build so that cgpt's `make` finds it as ../Grid/build relative to gpt/
@@ -103,19 +108,23 @@ build_grid() {
       LDFLAGS="-fiopenmp -fsycl -fsycl-device-code-split=per_kernel -lze_loader -L${MKLROOT}/lib -qmkl=parallel -lsycl -fsycl-max-parallel-link-jobs=16 -fno-sycl-rdc -lnuma -Wl,-rpath,${GMP}/lib -Wl,-rpath,${MPFR}/lib" \
       CXXFLAGS="-fPIC -fiopenmp -fsycl-unnamed-lambda -fsycl -Wno-tautological-compare -qmkl=parallel"
   # Nc=3 (Grid default); the Tuolumne build used --enable-Nc=4.
+  else
+    echo "==== Grid/build already configured: skipping bootstrap + configure (FORCE_CONFIGURE=1 to redo)"
+  fi
+  cd ${dir_build}/Grid/build
   run grid_make make -j ${NJ}
   run grid_install make install
 }
 
 # ---------------- GPT / cgpt ----------------
 build_gpt() {
-  # Build the gpt checkout this script lives in (NM's fork, branch rmhmc-trainable-kernel),
+  # Build the gpt checkout this script lives in (NM's fork, branch master),
   # as gpt's own scripts/bootstrap/* do. Fall back to cloning the fork if run standalone.
   local root=${gpt_root}
   if [ -z "${root}" ]; then
     cd ${dir_build}
     # [ -d gpt ] || run gpt_clone git clone -b 2024-10 https://github.com/lehner/gpt
-    [ -d gpt ] || run gpt_clone git clone -b rmhmc-trainable-kernel https://github.com/nobuyukimatsumoto68/gpt
+    [ -d gpt ] || run gpt_clone git clone -b master https://github.com/nobuyukimatsumoto68/gpt
     root=${dir_build}/gpt
   fi
   echo "==== building cgpt in ${root}"
