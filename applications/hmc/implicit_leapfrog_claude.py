@@ -22,8 +22,12 @@ import numpy as np
 
 
 class implicit_leapfrog:
-    def __init__(self, kinetic, action, tol=1e-12, max_iter=100, verbose=False, use_aitken=False, aitken_mode="vector"):
+    def __init__(self, kinetic, action, tol=1e-12, max_iter=100, verbose=False, use_aitken=False, aitken_mode="vector", cache_action=False, reuse_action=True):
         self.kinetic = kinetic
+        # cache_action: compute the U-only action force once per U in step() (it does not depend on P_h);
+        # default False keeps the original behaviour. Useful when the action force is expensive (e.g. the R / log det term).
+        self.cache_action = cache_action
+        self.reuse_action = reuse_action  # with cache_action: reuse the U_1 action force as the next step's U_0 force
         self.action = action
         self.tol = tol
         self.max_iter = max_iter
@@ -56,8 +60,15 @@ class implicit_leapfrog:
         # (1) P_h = P_0 - a F(U_0, P_h)
         P0 = g.copy(P)
         Ph = g.copy(P)
+        # FS0 = self.action.gradient(U, U) if self.cache_action else None
+        if self.cache_action:
+            # reuse the action force at U_1 of the previous step (same U; valid within one __call__ only)
+            FS0 = self._FS_next if (self.reuse_action and getattr(self, "_FS_next", None) is not None) else self.action.gradient(U, U)
+        else:
+            FS0 = None
         for n_P in range(1, self.max_iter + 1):
-            F = self.force(U, Ph)
+            # F = self.force(U, Ph)
+            F = self.force(U, Ph) if FS0 is None else [g(fs + fk) for fs, fk in zip(FS0, self.kinetic.gradient(U + Ph, U))]
             Pn = [g(p0 - a * f) for p0, f in zip(P0, F)]
             res = self.rms(Pn, Ph)
             Ph = Pn
@@ -79,10 +90,17 @@ class implicit_leapfrog:
             raise RuntimeError(f"implicit U update did not converge: res = {res}")
 
         # (3) P_1 = P_h - a F(U_1, P_h)
-        F = self.force(U1, Ph)
+        # F = self.force(U1, Ph)
+        if self.cache_action:
+            FS1 = self.action.gradient(U1, U1)
+            F = [g(fs + fk) for fs, fk in zip(FS1, self.kinetic.gradient(U1 + Ph, U1))]
+        else:
+            F = self.force(U1, Ph)
         for mu in range(len(P)):
             U[mu] @= U1[mu]
             P[mu] @= Ph[mu] - a * F[mu]
+        if self.cache_action:
+            self._FS_next = FS1  # action force at the new U (= U_1) for the next step
 
         self.niter_log.append((n_P, n_U))
         if self.verbose:
@@ -175,6 +193,7 @@ class implicit_leapfrog:
     # callback(k, U, P) is called after MD step k = 1..nstep (optional; for measurements along the trajectory)
     def __call__(self, U, P, tau, nstep, callback=None):
         eps = tau / nstep
+        self._FS_next = None  # cross-step action-force reuse is only valid within one trajectory
         for i in range(nstep):
             # self.step(U, P, eps)
             if self.use_aitken:
