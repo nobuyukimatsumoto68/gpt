@@ -7,7 +7,7 @@
 # Fit: minimize Var_lambda[log(p^2 (lambda + m^2))] over the N/2 complex roots z_j (start: Chebyshev roots),
 # compared with the best real-rooted (det-1-like / heat-kernel) polynomial of the same degree.
 # Design: genesis/rmhmc_trainable_kernel_impl_plan_claude.md, entries (13)-(14). numpy only; data + gnuplot script.
-# Usage: python3 fa_complex_claude.py [--m2 0.586] [--out plot.png]; then gnuplot <out base>.gp
+# Usage: python3 fa_complex_claude.py [--m2 0.586] [--lmax 16] [--t0 7.5] [--out plot.png]; then gnuplot <out base>.gp
 #
 import numpy as np
 from numpy.polynomial import chebyshev as cheb
@@ -21,7 +21,9 @@ def arg(name, default):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
 
 
-LMAX = 16.0
+# LMAX = 16.0
+LMAX = float(arg("--lmax", "16.0"))  # 16 (transverse improved, 3 directions) or 64/3 (full improved, 4 directions)
+T0 = float(arg("--t0", "7.5"))  # T = T0 - lambda: 7.5 (transverse) or 10 (full)
 m2 = float(arg("--m2", str(4 * np.sin(np.pi / 8) ** 2)))
 out = arg("--out", "fa_complex_claude.png")
 lam = np.linspace(0.0, LMAX, 801)
@@ -149,3 +151,17 @@ gp = (f'set terminal pdfcairo size 11in,3.4in font ",9" noenhanced\nset output "
       + f'reset\nset terminal pngcairo size 1800,560 font ",11" noenhanced\nset output "{base}.png"\n' + gp_body)
 open(base + ".gp", "wt").write(gp)
 print(f"# wrote {base}.dat, {base}_roots.dat, {base}.gp")
+
+# (alpha_j, beta_j) of 1 + alpha T + beta T^2 for each complex pair, T = T0 - lambda
+with open(base + "_coeffs.py", "wt") as f:
+    f.write(f"# FA polynomial coefficients from fa_complex_claude.py: m2 = {m2}, lambda in [0, {LMAX}], T = {T0} - lambda\n")
+    f.write("COEFFS = {\n    0: [],\n")
+    for N, r, vr, z, vc, vcheb, sr, sc in rows:
+        co = []
+        for x in sorted(z, key=lambda c: c.real):
+            sft = T0 - x.real
+            c0 = sft * sft + x.imag**2
+            co.append((float(round(-2 * sft / c0, 6)), float(round(1 / c0, 6))))
+        f.write(f"    {N}: {co},\n")
+    f.write("}\n")
+print(f"# wrote {base}_coeffs.py")

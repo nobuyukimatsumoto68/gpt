@@ -20,16 +20,23 @@ from path_smear_claude import path_layer, hops_T1, hops_R
 COEFFS_N8 = [(-0.240073, 0.017197), (-0.089958, 0.030094), (0.191793, 0.018357), (0.195884, 0.010038)]
 
 
-def improved_hops(nd, mu):
+# improved covariant Laplacian hops for component mu: (4/3) (distance-1) - (1/12) (distance-2), straight Wilson lines.
+# longitudinal = False: transverse only (nu != mu; free symbol 15/2 - lambda_perp, lambda_perp in [0, 16]);
+# longitudinal = True:  all nu incl. nu = mu (P_mu hopping along its own direction; full improved Laplacian,
+#                       free symbol 10 - lambda, lambda in [0, 64/3]; NM 2026-10-15, plan entry (19)).
+def improved_hops(nd, mu, longitudinal=False):
     hops = [(p, (4.0 / 3.0) * w) for p, w in hops_T1(nd, mu)]
     for nu in range(nd):
         if nu != mu:
             hops += [(p, (-1.0 / 12.0) * w) for p, w in hops_R(nu)]
+    if longitudinal:
+        hops += [([(mu, s)], 4.0 / 3.0) for s in (+1, -1)]
+        hops += [(p, (-1.0 / 12.0) * w) for p, w in hops_R(mu)]
     return hops
 
 
 class poly_kernel:
-    def __init__(self, U, coeffs, ones=None, cg_tol=1e-12, cg_maxiter=1000, fast_grad=True, transport_cache=False):
+    def __init__(self, U, coeffs, ones=None, cg_tol=1e-12, cg_maxiter=1000, fast_grad=True, transport_cache=False, longitudinal=False):
         self.U = U
         self.fast_grad = fast_grad  # True: grad_A_fast; False: original grad_A (reference)
         self.nd = len(U)
@@ -39,7 +46,12 @@ class poly_kernel:
             ones[:] = 1.0
         # one unmasked path layer per component (write = read = all sites, eta = 1): used for hop and force
         # self.T_mu = [path_layer(U, mu, improved_hops(self.nd, mu), ones, ones, 1.0, f"T_imp mu={mu}") for mu in range(self.nd)]
-        self.T_mu = [path_layer(U, mu, improved_hops(self.nd, mu), ones, ones, 1.0, f"T_imp mu={mu}", cache=transport_cache) for mu in range(self.nd)]
+        # self.T_mu = [path_layer(U, mu, improved_hops(self.nd, mu), ones, ones, 1.0, f"T_imp mu={mu}", cache=transport_cache) for mu in range(self.nd)]
+        self.longitudinal = longitudinal
+        self.T_mu = [
+            path_layer(U, mu, improved_hops(self.nd, mu, longitudinal), ones, ones, 1.0, f"T_imp mu={mu}", cache=transport_cache)
+            for mu in range(self.nd)
+        ]
         self.cg_tol = cg_tol
         self.cg_maxiter = cg_maxiter
         self.cg_iters = []
@@ -167,6 +179,7 @@ class poly_functional_base(g.group.differentiable_functional):
     # fingerprint f(U) = sum_mu <U_mu, Z_mu> with a fixed random field Z; shared between all poly functionals
     # (kinetic and log det). Default False = original behaviour.
     transport_cache = False
+    longitudinal = False  # True: full improved covariant Laplacian (use poly_coeffs_full_claude.COEFFS)
     _shared = {"key": None, "kernel": None, "Z": None}
 
     def __init__(self, coeffs, cg_tol=1e-12):
@@ -192,15 +205,15 @@ class poly_functional_base(g.group.differentiable_functional):
             self.ones = g.complex(U[0].grid)
             self.ones[:] = 1.0
         if not self.transport_cache:
-            self.last = poly_kernel(U, self.coeffs, self.ones, self.cg_tol, fast_grad=self.fast_grad)
+            self.last = poly_kernel(U, self.coeffs, self.ones, self.cg_tol, fast_grad=self.fast_grad, longitudinal=self.longitudinal)
             return self.last
-        key = (self.fingerprint(U), tuple(self.coeffs), self.cg_tol, self.fast_grad)
+        key = (self.fingerprint(U), tuple(self.coeffs), self.cg_tol, self.fast_grad, self.longitudinal)
         sh = poly_functional_base._shared
         if sh["key"] == key:
             sh["kernel"].rebind(U)
         else:
             sh["key"] = key
-            sh["kernel"] = poly_kernel(U, self.coeffs, self.ones, self.cg_tol, fast_grad=self.fast_grad, transport_cache=True)
+            sh["kernel"] = poly_kernel(U, self.coeffs, self.ones, self.cg_tol, fast_grad=self.fast_grad, transport_cache=True, longitudinal=self.longitudinal)
         self.last = sh["kernel"]
         return self.last
 

@@ -14,7 +14,7 @@
 # Usage:
 #   python3 decorrelation_claude.py --eta 0.05 --niter 2 --stot 3.0 --nstep 60 --n 10 --load therm.cfg \
 #       [--L 8,8,8,8] [--beta 2.95] [--action iwasaki] [--js 1,2,4] [--meas_every 1] [--tol 1e-10] \
-#       [--kernel transverse|poly] [--cg_tol 1e-10] [--seed s] [--out file.dat] [--save final.cfg]
+#       [--kernel transverse|poly] [--poly_N 2|4|6|8] [--longitudinal 0|1] [--cg_tol 1e-10] [--seed s] [--out file.dat] [--save final.cfg]
 # Output (--out): one line per (trajectory, measurement): traj acc dH k t C C_j1 C_j2 ...
 #
 import gpt as g
@@ -60,12 +60,21 @@ S = g.qcd.gauge.action.iwasaki(beta) if action == "iwasaki" else g.qcd.gauge.act
 # K = transverse_kinetic(eta, niter)
 # lf = implicit_leapfrog(K, S, tol=tol)
 cg_tol = g.default.get_float("--cg_tol", tol)  # poly kernel CG tolerance (default: match the fixed-point tol)
+poly_N = g.default.get_int("--poly_N", 8)  # degree of the FA polynomial in T (2, 4, 6, 8)
+longitudinal = g.default.get_int("--longitudinal", 0)  # 1: full improved Laplacian (incl. nu = mu hops), refitted coefficients
 if kernel == "poly":
+    from poly_coeffs_family_claude import COEFFS as COEFFS_TRANS
+    from poly_coeffs_full_claude import COEFFS as COEFFS_FULL
+
+    coeffs = COEFFS_FULL[poly_N] if longitudinal else COEFFS_TRANS[poly_N]
     poly_functional_base.transport_cache = True  # reuse transports while U is unchanged (fingerprint-checked)
+    poly_functional_base.longitudinal = bool(longitudinal)
     # K = poly_kinetic(COEFFS_N8)
     # D = poly_logdet(COEFFS_N8)
-    K = poly_kinetic(COEFFS_N8, cg_tol=cg_tol)
-    D = poly_logdet(COEFFS_N8, cg_tol=cg_tol)
+    # K = poly_kinetic(COEFFS_N8, cg_tol=cg_tol)
+    # D = poly_logdet(COEFFS_N8, cg_tol=cg_tol)
+    K = poly_kinetic(coeffs, cg_tol=cg_tol)
+    D = poly_logdet(coeffs, cg_tol=cg_tol)
     Rfield = g.group.cartesian(U)  # auxiliary field for -log det A, redrawn every trajectory, fixed during MD
     lf = implicit_leapfrog(K, action_with_R(S, D, Rfield), tol=tol, cache_action=True)
 else:
@@ -82,11 +91,13 @@ for j in js:
     filters.append(G)
     g.message(f"shell j = {j}: lambda0 = {lam0:.4f}, sigma_lambda = {sig_lam:.4f}, Chebyshev degree {G.degree} (err {G.cheb_error:.1e})")
 
-g.message(f"lattice {L}, {action} beta = {beta}, kernel = {kernel}, eta = {eta}, niter = {niter}, stot = {stot}, nstep = {nstep}, meas_every = {meas_every}")
+g.message(f"lattice {L}, {action} beta = {beta}, kernel = {kernel}, poly_N = {poly_N}, longitudinal = {longitudinal}, eta = {eta}, niter = {niter}, stot = {stot}, nstep = {nstep}, meas_every = {meas_every}")
 
 fout = open(out, "wt") if (out is not None and g.rank() == 0) else None
 if fout is not None:
-    fout.write(f"# kernel {kernel} eta {eta} niter {niter} stot {stot} nstep {nstep} L {L} {action} beta {beta} js {js}\n")
+    # fout.write(f"# kernel {kernel} eta {eta} niter {niter} stot {stot} nstep {nstep} L {L} {action} beta {beta} js {js}\n")
+    kpar = (f"poly_N {poly_N} longitudinal {longitudinal} (eta/niter unused)" if kernel == "poly" else f"eta {eta} niter {niter}")
+    fout.write(f"# kernel {kernel} {kpar} stot {stot} nstep {nstep} L {L} {action} beta {beta} js {js}\n")
     fout.write("# traj acc dH k t C " + " ".join(f"C_j{j}" for j in js) + "\n")
 
 nacc = 0

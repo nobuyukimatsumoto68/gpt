@@ -6,18 +6,25 @@
 #   3. poly_kinetic: draw consistency; P- and U-gradients vs finite differences
 #   4. poly_logdet:  draw consistency; U-gradient vs finite differences
 #   5. implicit leapfrog with H = H_kin + S + H_R (R fixed): reversibility, eps^2 scaling   (--skip_leapfrog to skip)
-# Usage: python3 test_poly_kernel_claude.py [--L 8] [--skip_leapfrog]
+# Usage: python3 test_poly_kernel_claude.py [--L 8] [--skip_leapfrog] [--longitudinal]
+#   --longitudinal: full improved Laplacian (incl. nu = mu hops) with poly_coeffs_full_claude.COEFFS[8]
 #
 import gpt as g
 import numpy as np
 import os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from poly_kernel_claude import poly_kernel, poly_kinetic, poly_logdet, action_with_R, COEFFS_N8
+from poly_kernel_claude import poly_kernel, poly_kinetic, poly_logdet, action_with_R, COEFFS_N8, poly_functional_base
 from implicit_leapfrog_claude import implicit_leapfrog
 
 L = g.default.get_int("--L", 8)
 skip_leapfrog = "--skip_leapfrog" in sys.argv
+LONG = "--longitudinal" in sys.argv
+if LONG:
+    from poly_coeffs_full_claude import COEFFS as _CF
+
+    COEFFS_N8 = _CF[8]
+    poly_functional_base.longitudinal = True
 ND = 4
 grid = g.grid([L] * ND, g.double)
 rng = g.random("test_poly_kernel_claude")
@@ -45,7 +52,7 @@ idx = tuple(coor[:, d] for d in range(ND))
 phi = np.random.default_rng(2).normal(size=(ND,) + (L,) * ND)
 for mu in range(ND):
     P1[mu][coor] = (phi[mu][idx][:, None, None] * gen[None]).astype(np.complex128)
-A0 = poly_kernel(Uunit, COEFFS_N8)
+A0 = poly_kernel(Uunit, COEFFS_N8, longitudinal=LONG)
 out = A0.forward(P1)
 res = np.zeros_like(phi)
 for mu in range(ND):
@@ -54,7 +61,7 @@ for mu in range(ND):
 k = 2 * np.pi * np.indices((L,) * ND) / L
 ref = np.zeros_like(phi)
 for mu in range(ND):
-    t = sum((4.0 / 3.0) * 2 * np.cos(k[nu]) - (1.0 / 12.0) * 2 * np.cos(2 * k[nu]) for nu in range(ND) if nu != mu)
+    t = sum((4.0 / 3.0) * 2 * np.cos(k[nu]) - (1.0 / 12.0) * 2 * np.cos(2 * k[nu]) for nu in range(ND) if (LONG or nu != mu))
     p = np.prod([1 + a * t + b * t * t for a, b in COEFFS_N8], axis=0)
     ref[mu] = np.real(np.fft.ifftn(p * np.fft.fftn(phi[mu])))
 check("1. free field A P vs analytic symbol (FFT)", np.linalg.norm(res - ref) / np.linalg.norm(ref), 1e-12)
@@ -65,7 +72,7 @@ P = g.group.cartesian(U)
 Q = g.group.cartesian(U)
 rng.normal_element(P)
 rng.normal_element(Q)
-A = poly_kernel(U, COEFFS_N8)
+A = poly_kernel(U, COEFFS_N8, longitudinal=LONG)
 AP = A.forward(P)
 a, b = poly_kernel.ip(Q, AP), poly_kernel.ip(A.forward(Q), P)
 check("2. hermiticity", abs(a - b) / abs(a), 1e-13)
@@ -76,7 +83,7 @@ UV = [g(V * U[mu] * g.cshift(g.adj(V), mu, 1)) for mu in range(4)]
 PV = [g(V * x * g.adj(V)) for x in P]
 for x, y in zip(PV, P):
     x.otype = y.otype
-check("2. gauge covariance", rel(poly_kernel(UV, COEFFS_N8).forward(PV), [g(V * x * g.adj(V)) for x in AP]), 1e-13)
+check("2. gauge covariance", rel(poly_kernel(UV, COEFFS_N8, longitudinal=LONG).forward(PV), [g(V * x * g.adj(V)) for x in AP]), 1e-13)
 X = A.inverse(AP)
 check("2. CG inverse A^-1 A P = P", rel(X, P), 1e-10)
 g.message(f"CG iterations: {A.cg_iters}")
