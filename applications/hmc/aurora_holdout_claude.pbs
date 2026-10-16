@@ -1,0 +1,130 @@
+#!/bin/bash
+#PBS -N holdout
+#PBS -A GenesisHackathonOct26
+#PBS -q R8914313
+#PBS -l select=1
+#PBS -l walltime=02:00:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#
+# Hold-out U-turn test (genesis-6c / NM, 2026-10-16): the FA coefficients trained on ONE config
+# (tr_8933429_full_N{2,8}_claude_coeffs.py, fit on therm_8888_b.cfg) are tested on configs they were NOT trained on.
+# 4 start configs per volume, 1 trajectory each (s.e. = config-to-config). Iwasaki beta = 2.95, s_tot = 3,
+# full improved covariant Laplacian (--longitudinal 1). Also lambda_min(-Delta_imp[U]) on every start config
+# (lambda_min_claude.py), the input of NM's per-ensemble regulator m^2 = <lambda_min> (method (b)).
+# Plan: genesis/volume_N_scaling_impl_plan_claude.md.
+#   L = 8 : starts = 4 fresh eta = 0 chains of NTHERM8 traj from therm_8888_b.cfg (made here, tiles 0-3);
+#           runs: eta = 0, N = 2 / 8 analytic and trained (20 runs, 12 tiles, queued per tile).
+#   L = 16: starts = ens16/chain{0..3}_6.cfg (PBS 8935539); runs: N = 8 analytic + trained on tiles 0-7,
+#           N = 2 analytic + trained and eta = 0 queued on tiles 8-11.
+# NOT EXACT: no volume preservation for U-dependent kernels (arXiv:2412.19904).
+# Submit with aurora_holdout_submit_claude.sh <8|16>.
+set -u
+
+GPT=${GPT:-/flare/GenesisHackathonOct26/nmatsum/gpt}
+HMC=${GPT}/applications/hmc
+RUN=${RUN:-/flare/GenesisHackathonOct26/nmatsum/run_decorr_claude}
+LSIZE=${LSIZE:-8}
+NSTEP_N8=${NSTEP_N8:-60}
+NSTEP_N2=${NSTEP_N2:-120}
+NSTEP_E0=${NSTEP_E0:-200}
+NTHERM8=${NTHERM8:-20}
+cd ${RUN}
+
+# lmod scripts reference unset variables, so relax `set -u` around module loads.
+set +u
+module load frameworks            # python3.12 + numpy, as used to build cgpt
+set -u
+source ${GPT}/lib/cgpt/build/source.sh
+export SYCL_PROGRAM_COMPILE_OPTIONS="-ze-opt-large-register-file"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT   # 12 tiles visible as 12 devices
+export OMP_NUM_THREADS=8               # 12 processes x 8 threads < 104 host cores
+TAG=ho${LSIZE}_${PBS_JOBID%%.*}
+LL=${LSIZE},${LSIZE},${LSIZE},${LSIZE}
+CF8=${RUN}/tr_8933429_full_N8_claude_coeffs.py
+CF2=${RUN}/tr_8933429_full_N2_claude_coeffs.py
+if [ ${LSIZE} = 16 ]; then JS=1,2,4,8; MEAS=2; else JS=1,2,4; MEAS=1; fi
+COMMON="--L ${LL} --action iwasaki --beta 2.95 --tol 1e-10 --mpi 1.1.1.1 --stot 3.0 --js ${JS} --meas_every ${MEAS}"
+
+echo "==== job ${PBS_JOBID} on $(hostname), L=${LSIZE}, gpt $(git -C ${GPT} log --oneline -1)"
+
+# ---- start configs ----
+STARTS=()
+if [ ${LSIZE} = 8 ]; then
+  mkdir -p holdout8
+  for c in 0 1 2 3; do
+    ZE_AFFINITY_MASK=${c} python3 ${HMC}/hmc_transverse_claude.py --L 8,8,8,8 --action iwasaki --beta 2.95 --tol 1e-10 \
+        --mpi 1.1.1.1 --eta 0.0 --niter 1 --tau 1.0 --nstep 40 --n ${NTHERM8} --load therm_8888_b.cfg \
+        --save holdout8/start${c}.cfg --seed holdout8_c${c} > ${TAG}_therm${c}_claude.log 2>&1 &
+  done
+  wait
+  for c in 0 1 2 3; do
+    [ -f holdout8/start${c}.cfg ] || { echo "therm chain ${c} failed"; tail -5 ${TAG}_therm${c}_claude.log; exit 1; }
+    echo "start ${c}: $(grep -h TRAJ ${TAG}_therm${c}_claude.log | sed 's/.*TRAJ //' | awk '{n++; a+=$5} END{printf "acc %d/%d", a, n}'), last $(grep -h TRAJ ${TAG}_therm${c}_claude.log | tail -1 | sed 's/.*TRAJ/TRAJ/')"
+    STARTS+=(holdout8/start${c}.cfg)
+  done
+else
+  for c in 0 1 2 3; do
+    [ -f ens16/chain${c}_6.cfg ] || { echo "missing ens16/chain${c}_6.cfg"; exit 1; }
+    STARTS+=(ens16/chain${c}_6.cfg)
+  done
+fi
+
+# ---- lambda_min on every start config (4 tiles, parallel) ----
+for c in 0 1 2 3; do
+  ZE_AFFINITY_MASK=${c} python3 ${HMC}/lambda_min_claude.py --load ${STARTS[$c]} --longitudinal 1 --nev 4 --mpi 1.1.1.1 \
+      > ${TAG}_lmin${c}_claude.log 2>&1 &
+done
+wait
+for c in 0 1 2 3; do echo "lambda_min ${STARTS[$c]}: $(grep -h 'lambda_min ' ${TAG}_lmin${c}_claude.log | tail -1 | sed 's/.*lambda_min/lambda_min/')"; done
+
+# ---- U-turn runs: a queue of commands per tile, run sequentially on that tile ----
+declare -a Q
+add() {  # add <tile> <tag> <kernel args...>
+  local tile=$1 name=$2; shift 2
+  Q[$tile]="${Q[$tile]:-}${name}|$*;"
+}
+run_queue() {  # run_queue <tile>
+  local tile=$1 item name args
+  IFS=';' read -ra items <<< "${Q[$tile]:-}"
+  for item in "${items[@]}"; do
+    [ -z "${item}" ] && continue
+    name=${item%%|*}; args=${item#*|}
+    echo "==== [$(date -u +%T) UTC] tile ${tile} start ${name}"
+    ZE_AFFINITY_MASK=${tile} python3 ${HMC}/decorrelation_claude.py ${COMMON} ${args} --n 1 \
+        --seed ${TAG}_${name} --out ${TAG}_${name}_claude.dat > ${TAG}_${name}_claude.log 2>&1
+    echo "==== [$(date -u +%T) UTC] tile ${tile} done  ${name}: $(grep -h TRAJ ${TAG}_${name}_claude.log | sed 's/.*TRAJ/TRAJ/' | cut -c1-90)"
+  done
+}
+
+N8A="--kernel poly --poly_N 8 --longitudinal 1 --nstep ${NSTEP_N8}"
+N8T="--kernel poly --poly_N 8 --longitudinal 1 --coeffs_file ${CF8} --nstep ${NSTEP_N8}"
+N2A="--kernel poly --poly_N 2 --longitudinal 1 --nstep ${NSTEP_N2}"
+N2T="--kernel poly --poly_N 2 --longitudinal 1 --coeffs_file ${CF2} --nstep ${NSTEP_N2}"
+E0="--eta 0.0 --niter 1 --nstep ${NSTEP_E0}"
+if [ ${LSIZE} = 16 ]; then
+  # N=8 (most expensive, the priority) one per tile on 0-7; N=2 and eta=0 shared on 8-11
+  for c in 0 1 2 3; do
+    add ${c}       N8a_c${c} ${N8A} --load ${STARTS[$c]}
+    add $((c + 4)) N8t_c${c} ${N8T} --load ${STARTS[$c]}
+    add $((c + 8)) N2t_c${c} ${N2T} --load ${STARTS[$c]}
+    add $((c + 8)) N2a_c${c} ${N2A} --load ${STARTS[$c]}
+    add $((c + 8)) e0_c${c}  ${E0}  --load ${STARTS[$c]}
+  done
+else
+  # 20 runs on 12 tiles, balanced by cost (N8 ~ 550 s, N2 ~ 340 s, eta=0 ~ 140 s per traj at 8^4)
+  for c in 0 1 2 3; do
+    add ${c}       N8a_c${c} ${N8A} --load ${STARTS[$c]}
+    add $((c + 4)) N8t_c${c} ${N8T} --load ${STARTS[$c]}
+    add $((c + 8)) N2t_c${c} ${N2T} --load ${STARTS[$c]}
+    add $((c + 8)) e0_c${c}  ${E0}  --load ${STARTS[$c]}
+    add ${c}       N2a_c${c} ${N2A} --load ${STARTS[$c]}
+  done
+fi
+for ((t = 0; t < 12; t++)); do run_queue ${t} & done
+wait
+
+echo "==== [$(date -u +%T) UTC] all done"
+for f in ${RUN}/${TAG}_*_c?_claude.log; do
+  echo "$(basename ${f}): $(grep -h -E 'TRAJ|Traceback' ${f} | sed 's/.*\(TRAJ\|Traceback\)/\1/' | cut -c1-80 | tail -1)"
+done
