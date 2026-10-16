@@ -1,0 +1,74 @@
+#!/bin/bash
+#PBS -N ens16
+#PBS -A GenesisHackathonOct26
+#PBS -q R8914313
+#PBS -l select=1
+#PBS -l walltime=01:30:00
+#PBS -l filesystems=home:flare
+#PBS -j oe
+#
+# 16^4 Iwasaki beta = 2.95 ensemble for the volume scaling study (genesis/volume_N_scaling_impl_plan_claude.md,
+# "Revised order", step 1). Start: the thermalized 8^4 config replicated 2^4 times (replicate_cfg_claude.py),
+# then NCHAIN independent eta = 0 HMC chains (different seeds), one per PVC tile, re-thermalizing from that start.
+# Each chain runs NCHUNK chunks of NPER trajectories; every chunk saves a config, so the walltime cannot lose
+# work, and the plaquette per chunk shows when the 8^4 periodicity has washed out.
+# tau = 1, nstep NSTEP: Delta H^2 ~ V eps^4, so 16^4 needs eps halved vs 8^4 (8^4 near equilibrium: nstep 40).
+# Output: ${RUN}/ens16/chain<c>_<k>.cfg and ens16_<jobid>_chain<c>_claude.log.
+# Submit with aurora_ens16_submit_claude.sh.
+set -u
+
+GPT=${GPT:-/flare/GenesisHackathonOct26/nmatsum/gpt}
+HMC=${GPT}/applications/hmc
+RUN=${RUN:-/flare/GenesisHackathonOct26/nmatsum/run_decorr_claude}
+NCHAIN=${NCHAIN:-8}
+NCHUNK=${NCHUNK:-6}
+NPER=${NPER:-5}
+NSTEP=${NSTEP:-80}
+mkdir -p ${RUN}/ens16
+cd ${RUN}
+
+# lmod scripts reference unset variables, so relax `set -u` around module loads.
+set +u
+module load frameworks            # python3.12 + numpy, as used to build cgpt
+set -u
+source ${GPT}/lib/cgpt/build/source.sh
+export SYCL_PROGRAM_COMPILE_OPTIONS="-ze-opt-large-register-file"
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT   # 12 tiles visible as 12 devices
+export OMP_NUM_THREADS=8               # 8 chains x 8 threads < 104 host cores
+TAG=${PBS_JOBID%%.*}
+
+echo "==== job ${PBS_JOBID} on $(hostname), gpt $(git -C ${GPT} log --oneline -1)"
+echo "==== [$(date -u +%T) UTC] replicate therm_8888_b.cfg -> ens16/start_16161616.cfg"
+ZE_AFFINITY_MASK=0 python3 ${HMC}/replicate_cfg_claude.py --load therm_8888_b.cfg --L 16,16,16,16 \
+    --save ens16/start_16161616.cfg --mpi 1.1.1.1 > ens16_${TAG}_replicate_claude.log 2>&1 \
+    || { echo "replication failed"; tail -5 ens16_${TAG}_replicate_claude.log; exit 1; }
+grep -h replicated ens16_${TAG}_replicate_claude.log
+
+chain() {  # chain <c>: NCHUNK chunks of NPER eta = 0 trajectories, saving after each chunk
+  local c=$1 in=ens16/start_16161616.cfg k
+  for ((k = 1; k <= NCHUNK; k++)); do
+    local out=ens16/chain${c}_${k}.cfg
+    ZE_AFFINITY_MASK=${c} python3 ${HMC}/hmc_transverse_claude.py --L 16,16,16,16 --action iwasaki --beta 2.95 \
+        --tol 1e-10 --mpi 1.1.1.1 --eta 0.0 --niter 1 --tau 1.0 --nstep ${NSTEP} --n ${NPER} \
+        --load ${in} --save ${out} --seed ens16_c${c}_k${k} >> ens16_${TAG}_chain${c}_claude.log 2>&1 \
+        || { echo "chain ${c} chunk ${k} failed"; return 1; }
+    echo "==== [$(date -u +%T) UTC] chain ${c} chunk ${k}: $(grep -h TRAJ ens16_${TAG}_chain${c}_claude.log | tail -1 | sed 's/.*TRAJ/TRAJ/')"
+    in=${out}
+  done
+}
+
+probe() {  # cost probe on tile 8: one short 8^4-trained N=8 trajectory on 16^4 (s/step, dH) to size the U-turn job
+  local cf=${RUN}/tr_8933429_full_N8_claude_coeffs.py
+  [ -f ${cf} ] || { echo "no ${cf}: skipping the cost probe"; return 0; }
+  ZE_AFFINITY_MASK=8 python3 ${HMC}/decorrelation_claude.py --L 16,16,16,16 --action iwasaki --beta 2.95 --tol 1e-10 \
+      --mpi 1.1.1.1 --kernel poly --poly_N 8 --longitudinal 1 --coeffs_file ${cf} --stot 0.5 --nstep 20 --n 1 \
+      --js 1,2,4,8 --meas_every 0 --log_h 1 --load ens16/start_16161616.cfg --seed ens16_probe \
+      > ens16_${TAG}_probe_N8_claude.log 2>&1
+  echo "==== [$(date -u +%T) UTC] cost probe: $(grep -h TRAJ ens16_${TAG}_probe_N8_claude.log | sed 's/.*TRAJ/TRAJ/')"
+}
+
+for ((c = 0; c < NCHAIN; c++)); do chain ${c} & done
+probe &
+wait
+echo "==== [$(date -u +%T) UTC] all chains done"
+ls -la ens16/
