@@ -12,6 +12,11 @@
 #   Chebyshev acceleration of Lanczos: e.g. Y. Saad, "Numerical Methods for Large Eigenvalue Problems" (2011), ch. 8.
 # Note: single-vector Lanczos resolves one vector per exactly degenerate eigenspace (free field: one copy per distinct
 #   lambda); on interacting configurations the degeneracies are lifted.
+# su(3) restriction: iterate with  P L + lam_max (1 - P)  (P = traceless-hermitian projector); the trace part of a 3x3
+#   field is transported trivially (free spectrum, exact zero mode) and would otherwise be picked up from rounding noise.
+# Checks (Mac, 2026-10-16): free 8^4 full: 0.61438192 = closed form; thermalized 4^3x8 (Iwasaki 2.95): full 1.477118
+#   (same for --cheb_low 2/order 30 and 4/50, residual 1e-29), transverse 0.834494.  --free 1 --longitudinal 0 breaks
+#   down (Krylov exhaustion: only 35 distinct free values); not a problem on interacting configurations.
 # Usage: python3 lambda_min_claude.py --load cfg [--longitudinal 1] [--nev 4] [--cheb_low 2.0] [--cheb_order 30]
 #        python3 lambda_min_claude.py --free 1 --L 8 [--longitudinal 1]       (free-field check vs the closed form)
 #   output: per mu the lowest --nev eigenvalues; "lambda_min <value>" = min over mu (grep-able)
@@ -78,20 +83,27 @@ irl = g.algorithms.eigen.irl(
 
 all_ev = []
 t_start = time.time()
-for mu in range(4):
+# longitudinal: improved_hops(mu, True) hops along ALL nu for every mu -> T_mu identical, solve mu = 0 only
+mus = [0] if longitudinal else range(4)
+# for mu in range(4):
+for mu in mus:
     layer = path_layer(U, mu, improved_hops(4, mu, longitudinal), ones, ones, 1.0, f"T_imp mu={mu}", cache=True)
 
     def lap(dst, src):
         dst @= T0 * src - layer.hop(src)  # -Delta_imp
         # keep the iteration in su(3): the trace (u(1)) part of a 3x3 matrix field is invariant under the adjoint
         # transport, so it sees the FREE Laplacian (exact zero mode); rounding noise there is amplified ~1e8 by the
-        # Chebyshev filter and IRL would return it.  Project to traceless hermitian after every application.
-        dst @= g.qcd.gauge.project.traceless_hermitian(dst)
+        # Chebyshev filter and IRL would return it.  Use  P L + lam_max (1 - P),  P = traceless-hermitian projector:
+        # the non-su(3) sector is lifted to the top of the spectrum (a bare P L would put it at 0, the most amplified).
+        # dst @= g.qcd.gauge.project.traceless_hermitian(dst)
+        Pdst = g.qcd.gauge.project.traceless_hermitian(dst)
+        dst @= Pdst + lam_max * (src - g.qcd.gauge.project.traceless_hermitian(src))
         if free:
             # free check only: lift the U = 1 zero modes (constant algebra fields) to lam_max so the lowest
             # NONZERO lambda is resolved:  -Delta_imp + lam_max Pi_0,  Pi_0 v = (1/V) sum_x v(x)
             c0 = g.lattice(src)
-            c0[:] = g.sum(src) / grid.gsites
+            # c0[:] = g.sum(src) / grid.gsites
+            c0[:] = g.sum(g.qcd.gauge.project.traceless_hermitian(src)) / grid.gsites  # su(3) part only (else 2 lam_max > Chebyshev high)
             dst += lam_max * c0
 
     op = g.matrix_operator(lap)
